@@ -42,14 +42,15 @@ jobs:
 
     steps:
       - name: Checkout Forge source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: Landen1682/Forge
+          token: ${{ secrets.FORGE_SOURCE_TOKEN }}
           ref: ${{ inputs.source_ref }}
           path: source
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: "22"
           cache: npm
@@ -371,12 +372,13 @@ jobs:
 
     steps:
       - name: Checkout release repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Checkout Forge source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: Landen1682/Forge
+          token: ${{ secrets.FORGE_SOURCE_TOKEN }}
           ref: ${{ inputs.source_ref }}
           path: source
 
