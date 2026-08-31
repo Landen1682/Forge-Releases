@@ -65,6 +65,8 @@ jobs:
         working-directory: source
         shell: bash
         run: |
+          rm -rf engine/build
+
           cmake \
             -S engine \
             -B engine/build \
