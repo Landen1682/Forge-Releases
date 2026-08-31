@@ -1,0 +1,536 @@
+name: Publish Forge Suite
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Forge source branch/tag/commit
+        required: true
+        default: main
+      tag:
+        description: Forge-Releases release tag
+        required: true
+        default: v7.0.1
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-latest
+            platform: darwin-aarch64
+            os: macos
+
+          - runner: macos-15-intel
+            platform: darwin-x86_64
+            os: macos
+
+          - runner: windows-latest
+            platform: windows-x86_64
+            os: windows
+
+    runs-on: ${{ matrix.runner }}
+
+    env:
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+
+    steps:
+      - name: Checkout Forge source
+        uses: actions/checkout@v4
+        with:
+          repository: Landen1682/Forge
+          ref: ${{ inputs.source_ref }}
+          path: source
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: source/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: source
+        shell: bash
+        run: npm ci
+
+      - name: Configure Forge Engine
+        working-directory: source
+        shell: bash
+        run: |
+          cmake \
+            -S engine \
+            -B engine/build \
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build Forge Engine
+        working-directory: source
+        shell: bash
+        run: |
+          cmake \
+            --build engine/build \
+            --config Release \
+            --parallel 2
+
+      - name: Bundle Forge Engine into Desktop
+        working-directory: source
+        shell: bash
+        env:
+          FORGE_PLATFORM: ${{ matrix.platform }}
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import os
+          import shutil
+
+          root=Path.cwd()
+
+          platform=os.environ["FORGE_PLATFORM"]
+
+          wanted=(
+              "ForgeEngine.exe"
+              if platform.startswith("windows")
+              else "ForgeEngine"
+          )
+
+          matches=[
+              p for p in
+              (root/"engine"/"build").rglob(wanted)
+              if p.is_file()
+              and "CMakeFiles" not in p.parts
+          ]
+
+          if not matches:
+              raise SystemExit(
+                  f"Could not find built {wanted}"
+              )
+
+          exe=sorted(
+              matches,
+              key=lambda p:len(p.parts)
+          )[0]
+
+          destination=(
+              root/
+              "apps"/"desktop"/
+              "src-tauri"/
+              "resources"/
+              "engine"
+          )
+
+          destination.mkdir(
+              parents=True,
+              exist_ok=True
+          )
+
+          shutil.copy2(
+              exe,
+              destination/wanted
+          )
+
+          starter=root/"engine"/"examples"/"Starter"
+
+          if starter.exists():
+              shutil.copytree(
+                  starter,
+                  destination/"Starter",
+                  dirs_exist_ok=True,
+              )
+
+          print(
+              "Bundled:",
+              exe,
+              "->",
+              destination/wanted
+          )
+          PY
+
+      - name: Build Forge Studios
+        working-directory: source
+        shell: bash
+        run: |
+          npm run tauri \
+            --workspace apps/desktop \
+            -- build
+
+      - name: Build Forge Code
+        working-directory: source
+        shell: bash
+        run: |
+          npm run tauri \
+            --workspace apps/code \
+            -- build
+
+      - name: Build Forge Builder
+        working-directory: source
+        shell: bash
+        run: |
+          npm run tauri \
+            --workspace apps/builder \
+            -- build
+
+      - name: Collect release assets
+        working-directory: source
+        shell: bash
+        env:
+          FORGE_PLATFORM: ${{ matrix.platform }}
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import json
+          import os
+          import shutil
+
+          root=Path.cwd()
+          platform=os.environ["FORGE_PLATFORM"]
+
+          output=root/"release-stage"
+          output.mkdir(
+              parents=True,
+              exist_ok=True
+          )
+
+          apps={
+              "desktop":"forge-studios",
+              "code":"forge-code",
+              "builder":"forge-builder",
+          }
+
+          def version_for(app):
+              config=json.loads(
+                  (
+                      root/
+                      "apps"/app/
+                      "src-tauri"/
+                      "tauri.conf.json"
+                  ).read_text()
+              )
+
+              return config["version"]
+
+          def newest(paths):
+              paths=[
+                  p for p in paths
+                  if p.is_file()
+              ]
+
+              if not paths:
+                  return None
+
+              return max(
+                  paths,
+                  key=lambda p:p.stat().st_mtime
+              )
+
+          for app,slug in apps.items():
+              version=version_for(app)
+
+              target=(
+                  root/
+                  "apps"/app/
+                  "src-tauri"/
+                  "target"
+              )
+
+              if platform.startswith("darwin"):
+                  updater=newest(
+                      target.rglob(
+                          "*.app.tar.gz"
+                      )
+                  )
+
+                  if not updater:
+                      raise SystemExit(
+                          f"{app}: missing mac updater archive"
+                      )
+
+                  sig=Path(
+                      str(updater)+".sig"
+                  )
+
+                  if not sig.exists():
+                      raise SystemExit(
+                          f"{app}: missing updater signature"
+                      )
+
+                  name=(
+                      f"{slug}-{version}-"
+                      f"{platform}.app.tar.gz"
+                  )
+
+                  shutil.copy2(
+                      updater,
+                      output/name
+                  )
+
+                  shutil.copy2(
+                      sig,
+                      output/(name+".sig")
+                  )
+
+                  dmg=newest(
+                      target.rglob("*.dmg")
+                  )
+
+                  if dmg:
+                      shutil.copy2(
+                          dmg,
+                          output/(
+                              f"{slug}-{version}-"
+                              f"{platform}.dmg"
+                          )
+                      )
+
+              elif platform=="windows-x86_64":
+                  exe_candidates=[
+                      p for p in
+                      target.rglob("*.exe")
+                      if p.is_file()
+                      and (
+                          Path(
+                              str(p)+".sig"
+                          ).exists()
+                      )
+                  ]
+
+                  updater=newest(
+                      exe_candidates
+                  )
+
+                  if not updater:
+                      raise SystemExit(
+                          f"{app}: missing Windows updater installer"
+                      )
+
+                  sig=Path(
+                      str(updater)+".sig"
+                  )
+
+                  name=(
+                      f"{slug}-{version}-"
+                      "windows-x86_64.exe"
+                  )
+
+                  shutil.copy2(
+                      updater,
+                      output/name
+                  )
+
+                  shutil.copy2(
+                      sig,
+                      output/(name+".sig")
+                  )
+
+                  msi=newest(
+                      target.rglob("*.msi")
+                  )
+
+                  if msi:
+                      shutil.copy2(
+                          msi,
+                          output/(
+                              f"{slug}-{version}-"
+                              "windows-x86_64.msi"
+                          )
+                      )
+
+              else:
+                  raise SystemExit(
+                      f"Unknown platform {platform}"
+                  )
+
+          print()
+          print("Collected release assets:")
+
+          for path in sorted(output.iterdir()):
+              print(
+                  " -",
+                  path.name,
+                  path.stat().st_size
+              )
+          PY
+
+      - name: Upload platform artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: forge-suite-${{ matrix.platform }}
+          path: source/release-stage/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish Forge Release
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout release repository
+        uses: actions/checkout@v4
+
+      - name: Checkout Forge source
+        uses: actions/checkout@v4
+        with:
+          repository: Landen1682/Forge
+          ref: ${{ inputs.source_ref }}
+          path: source
+
+      - name: Download all builds
+        uses: actions/download-artifact@v4
+        with:
+          pattern: forge-suite-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate updater manifests
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          from datetime import datetime,timezone
+          import json
+          import os
+
+          root=Path.cwd()
+
+          assets=root/"release-assets"
+
+          repo="Landen1682/Forge-Releases"
+          tag=os.environ["RELEASE_TAG"]
+
+          apps={
+              "desktop":"forge-studios",
+              "code":"forge-code",
+              "builder":"forge-builder",
+          }
+
+          def version_for(app):
+              return json.loads(
+                  (
+                      root/
+                      "source"/
+                      "apps"/app/
+                      "src-tauri"/
+                      "tauri.conf.json"
+                  ).read_text()
+              )["version"]
+
+          for app,slug in apps.items():
+              version=version_for(app)
+
+              files={
+                  "darwin-aarch64":
+                      f"{slug}-{version}-darwin-aarch64.app.tar.gz",
+
+                  "darwin-x86_64":
+                      f"{slug}-{version}-darwin-x86_64.app.tar.gz",
+
+                  "windows-x86_64":
+                      f"{slug}-{version}-windows-x86_64.exe",
+              }
+
+              platforms={}
+
+              for platform,filename in files.items():
+                  artifact=assets/filename
+                  sig=assets/(filename+".sig")
+
+                  if not artifact.exists():
+                      raise SystemExit(
+                          f"Missing {artifact}"
+                      )
+
+                  if not sig.exists():
+                      raise SystemExit(
+                          f"Missing {sig}"
+                      )
+
+                  signature=sig.read_text().strip()
+
+                  if not signature:
+                      raise SystemExit(
+                          f"Empty signature: {sig}"
+                      )
+
+                  url=(
+                      "https://github.com/"
+                      f"{repo}/releases/download/"
+                      f"{tag}/{filename}"
+                  )
+
+                  platforms[platform]={
+                      "signature":signature,
+                      "url":url,
+                  }
+
+              manifest={
+                  "version":version,
+                  "notes":(
+                      f"Forge automatic update "
+                      f"{version}"
+                  ),
+                  "pub_date":
+                      datetime.now(
+                          timezone.utc
+                      ).isoformat(),
+                  "platforms":platforms,
+              }
+
+              destination=(
+                  assets/
+                  f"{slug}-latest.json"
+              )
+
+              destination.write_text(
+                  json.dumps(
+                      manifest,
+                      indent=2
+                  )+"\n"
+              )
+
+              print(
+                  "Generated",
+                  destination
+              )
+
+          print()
+          print("Release contents:")
+
+          for path in sorted(assets.iterdir()):
+              print(" -",path.name)
+          PY
+
+      - name: Create or update GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          set -euo pipefail
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Release exists: $RELEASE_TAG"
+          else
+            gh release create "$RELEASE_TAG" \
+              --target main \
+              --title "Forge Suite $RELEASE_TAG" \
+              --notes "Automated Forge Studios, Forge Code, Forge Builder, and updater release from Forge source $SOURCE_REF."
+          fi
+
+          gh release upload "$RELEASE_TAG" \
+            release-assets/* \
+            --clobber
+
+          gh release edit "$RELEASE_TAG" \
+            --latest
+
+          echo
+          echo "PASS · release published"
