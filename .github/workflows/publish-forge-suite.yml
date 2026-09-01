@@ -157,26 +157,188 @@ jobs:
       - name: Build Forge Studios
         working-directory: source
         shell: bash
+        env:
+          FORGE_OS: ${{ matrix.os }}
         run: |
-          npm run tauri \
-            --workspace apps/desktop \
-            -- build
+          set -euo pipefail
+
+          if [ "$FORGE_OS" = "macos" ]; then
+            npm run tauri --workspace apps/desktop -- build --bundles app
+          else
+            npm run tauri --workspace apps/desktop -- build
+          fi
 
       - name: Build Forge Code
         working-directory: source
         shell: bash
+        env:
+          FORGE_OS: ${{ matrix.os }}
         run: |
-          npm run tauri \
-            --workspace apps/code \
-            -- build
+          set -euo pipefail
+
+          if [ "$FORGE_OS" = "macos" ]; then
+            npm run tauri --workspace apps/code -- build --bundles app
+          else
+            npm run tauri --workspace apps/code -- build
+          fi
 
       - name: Build Forge Builder
         working-directory: source
         shell: bash
+        env:
+          FORGE_OS: ${{ matrix.os }}
         run: |
-          npm run tauri \
-            --workspace apps/builder \
-            -- build
+          set -euo pipefail
+
+          if [ "$FORGE_OS" = "macos" ]; then
+            npm run tauri --workspace apps/builder -- build --bundles app
+          else
+            npm run tauri --workspace apps/builder -- build
+          fi
+
+      - name: Create macOS DMGs manually
+        if: matrix.os == 'macos'
+        working-directory: source
+        shell: bash
+        env:
+          FORGE_PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p manual-dmgs
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import json
+          import os
+          import subprocess
+          import shutil
+
+          root=Path.cwd()
+          platform=os.environ["FORGE_PLATFORM"]
+
+          if platform not in {
+              "darwin-aarch64",
+              "darwin-x86_64",
+          }:
+              raise SystemExit(
+                  f"Unexpected platform: {platform}"
+              )
+
+          apps={
+              "desktop":{
+                  "product":"Forge Studios",
+                  "slug":"forge-studios",
+              },
+              "code":{
+                  "product":"Forge Code",
+                  "slug":"forge-code",
+              },
+              "builder":{
+                  "product":"Forge Builder",
+                  "slug":"forge-builder",
+              },
+          }
+
+          out=root/"manual-dmgs"
+          out.mkdir(
+              parents=True,
+              exist_ok=True,
+          )
+
+          for app,meta in apps.items():
+              config=json.loads(
+                  (
+                      root/
+                      "apps"/app/
+                      "src-tauri"/
+                      "tauri.conf.json"
+                  ).read_text()
+              )
+
+              version=config["version"]
+
+              bundle=(
+                  root/
+                  "apps"/app/
+                  "src-tauri"/
+                  "target"/
+                  "release"/
+                  "bundle"/
+                  "macos"/
+                  f'{meta["product"]}.app'
+              )
+
+              if not bundle.exists():
+                  raise SystemExit(
+                      f"Missing app bundle: {bundle}"
+                  )
+
+              stage=(
+                  root/
+                  "manual-dmg-stage"/
+                  app
+              )
+
+              if stage.exists():
+                  shutil.rmtree(stage)
+
+              stage.mkdir(
+                  parents=True
+              )
+
+              shutil.copytree(
+                  bundle,
+                  stage/bundle.name,
+                  symlinks=True,
+              )
+
+              applications=stage/"Applications"
+
+              try:
+                  applications.symlink_to(
+                      "/Applications"
+                  )
+              except FileExistsError:
+                  pass
+
+              dmg=(
+                  out/
+                  f'{meta["slug"]}-'
+                  f'{version}-'
+                  f'{platform}.dmg'
+              )
+
+              if dmg.exists():
+                  dmg.unlink()
+
+              subprocess.run(
+                  [
+                      "hdiutil",
+                      "create",
+                      "-volname",
+                      meta["product"],
+                      "-srcfolder",
+                      str(stage),
+                      "-ov",
+                      "-format",
+                      "UDZO",
+                      str(dmg),
+                  ],
+                  check=True,
+              )
+
+              if not dmg.exists():
+                  raise SystemExit(
+                      f"DMG was not created: {dmg}"
+                  )
+
+              print(
+                  "Created",
+                  dmg,
+                  dmg.stat().st_size,
+              )
+          PY
 
       - name: Collect release assets
         working-directory: source
@@ -277,8 +439,18 @@ jobs:
                       output/(name+".sig")
                   )
 
-                  dmg=newest(
-                      target.rglob("*.dmg")
+                  manual_dmg=(
+                      root/
+                      "manual-dmgs"/
+                      f"{slug}-{version}-{platform}.dmg"
+                  )
+
+                  dmg=(
+                      manual_dmg
+                      if manual_dmg.exists()
+                      else newest(
+                          target.rglob("*.dmg")
+                      )
                   )
 
                   if dmg:
